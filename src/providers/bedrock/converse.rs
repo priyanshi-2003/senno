@@ -7,10 +7,10 @@ use crate::error::Error;
 use crate::provider::LlmStream;
 use crate::types::{ContentPart, GenerateRequest, GenerateResponse, Role, Usage};
 
-use super::client::BedrockClient;
 use super::document::{to_document, to_value};
 use super::error::{PROVIDER, from_sdk};
 use super::stream;
+use super::types::BedrockClient;
 
 /// Prefix for a leading assistant message (a compaction summary) that has to
 /// be re-sent as a user message: Converse requires the first message to come
@@ -32,9 +32,6 @@ pub(super) fn to_converse(request: &GenerateRequest) -> Result<ConverseParts, Er
         tracing::warn!("web_fetch is unavailable on Bedrock; the model cannot fetch pages");
     }
     if request.thinking_budget.is_some() {
-        // Extended thinking returns reasoning blocks that must be sent back
-        // verbatim on the next tool round, and senno's history does not keep
-        // them yet. Ignoring the budget is safer than a broken second round.
         tracing::warn!("thinking_budget is not supported on Bedrock yet and is ignored");
     }
 
@@ -55,30 +52,26 @@ pub(super) fn to_converse(request: &GenerateRequest) -> Result<ConverseParts, Er
 }
 
 fn to_messages(messages: &[crate::types::Message]) -> Result<Vec<bt::Message>, Error> {
-    // Converse wants alternating roles and a user message first. senno's agent
-    // history can hold two assistant messages in a row (text, then a tool call
-    // in the next round) and start with an assistant summary after compaction,
-    // so merge runs of one role and re-role a leading assistant summary.
     let mut merged: Vec<(Role, Vec<bt::ContentBlock>)> = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
+    for message in messages {
         let mut role = message.role;
         let mut blocks = to_blocks(&message.content)?;
-        if index == 0 && role == Role::Assistant {
+        if blocks.is_empty() {
+            continue;
+        }
+        if merged.is_empty() && role == Role::Assistant {
             let text_only = blocks
                 .iter()
                 .all(|b| matches!(b, bt::ContentBlock::Text(_)));
-            if text_only {
-                role = Role::User;
-                for block in &mut blocks {
-                    if let bt::ContentBlock::Text(text) = block {
-                        *text = format!("{LEADING_ASSISTANT_PREFIX}{text}");
-                        break;
-                    }
-                }
+            if !text_only {
+                return Err(Error::config(
+                    "Converse needs the conversation to start with a user message, not an assistant tool call",
+                ));
             }
-        }
-        if blocks.is_empty() {
-            continue;
+            role = Role::User;
+            if let Some(bt::ContentBlock::Text(text)) = blocks.first_mut() {
+                *text = format!("{LEADING_ASSISTANT_PREFIX}{text}");
+            }
         }
         match merged.last_mut() {
             Some((last_role, last_blocks)) if *last_role == role => last_blocks.extend(blocks),
@@ -105,7 +98,6 @@ fn to_blocks(parts: &[ContentPart]) -> Result<Vec<bt::ContentBlock>, Error> {
     let mut blocks = Vec::with_capacity(parts.len());
     for part in parts {
         match part {
-            // Converse rejects empty text blocks.
             ContentPart::Text(text) if text.is_empty() => {}
             ContentPart::Text(text) => blocks.push(bt::ContentBlock::Text(text.clone())),
             ContentPart::ToolCall {
@@ -240,8 +232,6 @@ pub(super) fn to_usage(usage: &bt::TokenUsage) -> Usage {
     let to_u32 = |v: i32| u32::try_from(v).unwrap_or(0);
     let cache_read = usage.cache_read_input_tokens().map(to_u32);
     let cache_write = usage.cache_write_input_tokens().map(to_u32);
-    // senno's input_tokens counts every prompt token, cached ones included;
-    // Bedrock reports cache reads and writes separately.
     let input = to_u32(usage.input_tokens())
         .saturating_add(cache_read.unwrap_or(0))
         .saturating_add(cache_write.unwrap_or(0));
@@ -359,7 +349,6 @@ mod tests {
                 bt::ConversationRole::Assistant,
             ]
         );
-        // The last assistant message holds the text and the second tool call.
         let last = messages.last().unwrap().content();
         assert!(matches!(&last[0], bt::ContentBlock::Text(t) if t == "Here are three."));
         assert!(matches!(&last[1], bt::ContentBlock::ToolUse(t) if t.name() == "recommend"));
@@ -402,18 +391,19 @@ mod tests {
     #[test]
     fn tool_arguments_and_json_results_survive() {
         let history = vec![
+            Message::user("find shoes"),
             Message::tool_call("t1", "search", json!({"q": "shoes", "limit": 5})),
             Message::tool_result("t1", "search", json!({"count": 2})),
         ];
         let messages = to_messages(&history).unwrap();
-        match &messages[0].content()[0] {
+        match &messages[1].content()[0] {
             bt::ContentBlock::ToolUse(t) => {
                 assert_eq!(t.tool_use_id(), "t1");
                 assert_eq!(to_value(t.input()), json!({"q": "shoes", "limit": 5}));
             }
             other => panic!("expected tool use, got {other:?}"),
         }
-        match &messages[1].content()[0] {
+        match &messages[2].content()[0] {
             bt::ContentBlock::ToolResult(r) => {
                 assert!(
                     matches!(&r.content()[0], bt::ToolResultContentBlock::Text(t) if t == r#"{"count":2}"#)
@@ -421,6 +411,28 @@ mod tests {
             }
             other => panic!("expected tool result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn leading_tool_call_is_rejected() {
+        let history = vec![
+            Message::tool_call("t1", "search", json!({})),
+            Message::tool_result("t1", "search", json!({})),
+        ];
+        let err = to_messages(&history).unwrap_err();
+        assert!(!err.is_retryable(), "{err}");
+    }
+
+    #[test]
+    fn empty_first_message_does_not_hide_a_leading_summary() {
+        let history = vec![
+            Message::assistant(""),
+            Message::assistant("earlier summary"),
+            Message::user("next"),
+        ];
+        let messages = to_messages(&history).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role(), &bt::ConversationRole::User);
     }
 
     #[test]

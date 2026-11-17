@@ -99,6 +99,7 @@ pub enum SseEvent {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TokenUsage {
     pub calls: u32,
     pub compactions: u32,

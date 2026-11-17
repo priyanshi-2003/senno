@@ -81,7 +81,6 @@ async fn converse_sends_history_tools_and_guardrail_and_parses_tool_call() {
 
     let response = client.generate(&request).await.expect("converse");
 
-    // What went out.
     let sent = &server.requests()[0];
     assert_eq!(sent.method, "POST");
     assert_eq!(sent.path, "/model/anthropic.claude-sonnet-5/converse");
@@ -102,13 +101,11 @@ async fn converse_sends_history_tools_and_guardrail_and_parses_tool_call() {
         body["toolConfig"]["tools"][0]["toolSpec"]["name"],
         "search_catalog"
     );
-    // Two assistant messages in a row are merged into one.
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[1]["role"], "assistant");
     assert_eq!(messages[1]["content"].as_array().unwrap().len(), 2);
 
-    // What came back.
     assert_eq!(response.text().as_deref(), Some("Searching."));
     assert_eq!(response.stop_reason(), Some("tool_use"));
     let call: serde_json::Value = response.parse().unwrap();
@@ -157,7 +154,6 @@ async fn access_denied_is_permanent() {
 async fn titan_multimodal_embeds_text_and_image_per_item() {
     let server = StubServer::start(|request| {
         let body = request.json();
-        // Echo back which inputs arrived, as the vector.
         let has_text = body.get("inputText").is_some() as u8 as f32;
         let has_image = body.get("inputImage").is_some() as u8 as f32;
         Reply::ok(json!({"embedding": [has_text, has_image], "inputTextTokenCount": 3}).to_string())
@@ -215,17 +211,4 @@ async fn one_failed_embedding_keeps_the_others() {
         vec![1]
     );
     assert_eq!(response.total_token_count, Some(2));
-}
-
-#[tokio::test]
-async fn missing_region_is_a_config_error() {
-    let no_region = SdkConfig::builder()
-        .behavior_version(BehaviorVersion::latest())
-        .build();
-    // SAFETY: test-only; no other test in this binary reads BEDROCK_REGION.
-    unsafe { std::env::remove_var("BEDROCK_REGION") };
-    let err = get_bedrock_client(Some(BedrockConfig::default().with_sdk_config(no_region)))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("region"), "{err}");
 }

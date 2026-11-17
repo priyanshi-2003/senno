@@ -12,8 +12,8 @@ use serde::Deserialize;
 use crate::error::Error;
 use crate::types::{EmbedImage, EmbedRequest, EmbedResponse, Embedding};
 
-use super::client::BedrockClient;
 use super::error::{PROVIDER, from_sdk};
+use super::types::BedrockClient;
 
 const REQUEST_CONCURRENCY: usize = 4;
 
@@ -45,6 +45,9 @@ pub(super) fn validate(request: &EmbedRequest) -> Result<TitanKind, Error> {
     let kind = titan_kind(&request.model)?;
     if request.title.is_some() {
         return Err(Error::config("Titan embeddings do not accept a title"));
+    }
+    if request.task_type.is_some() {
+        return Err(Error::config("Titan embeddings do not accept a task_type"));
     }
     if !request.images.is_empty() && kind != TitanKind::Multimodal {
         return Err(Error::config(format!(

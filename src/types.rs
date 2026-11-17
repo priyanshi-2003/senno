@@ -254,6 +254,7 @@ impl GenerateResponse {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Usage {
     /// All prompt tokens, cache reads and cache writes included.
     pub input_tokens: Option<u32>,
@@ -302,9 +303,17 @@ pub struct EmbedRequest {
 }
 
 /// Raw image bytes (PNG or JPEG) to embed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EmbedImage {
     pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for EmbedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedImage")
+            .field("len", &self.data.len())
+            .finish()
+    }
 }
 
 impl EmbedImage {

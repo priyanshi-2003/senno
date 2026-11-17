@@ -45,8 +45,17 @@ where
             "{operation}: request could not be built: {}",
             DisplayErrorContext(&err)
         )),
-        // Timeouts, connection failures and unreadable responses are transient.
-        _ => Error::provider(
+        SdkError::TimeoutError(_) => Error::provider(
+            PROVIDER,
+            format!("{operation}: {}", DisplayErrorContext(&err)),
+        ),
+        SdkError::DispatchFailure(failure) if failure.is_timeout() || failure.is_io() => {
+            Error::provider(
+                PROVIDER,
+                format!("{operation}: {}", DisplayErrorContext(&err)),
+            )
+        }
+        _ => Error::provider_permanent(
             PROVIDER,
             format!("{operation}: {}", DisplayErrorContext(&err)),
         ),
@@ -82,6 +91,22 @@ mod tests {
             assert!(e.is_provider_error());
             assert!(!e.is_retryable(), "{code} must not be retryable");
         }
+    }
+
+    fn dispatch(connector: aws_sdk_bedrockruntime::error::ConnectorError) -> Error {
+        let err: SdkError<
+            aws_sdk_bedrockruntime::operation::converse::ConverseError,
+            aws_sdk_bedrockruntime::config::http::HttpResponse,
+        > = SdkError::dispatch_failure(connector);
+        from_sdk("Converse", err)
+    }
+
+    #[test]
+    fn credential_failures_are_permanent_but_io_and_timeouts_retry() {
+        use aws_sdk_bedrockruntime::error::ConnectorError;
+        assert!(!dispatch(ConnectorError::other("no credentials".into(), None)).is_retryable());
+        assert!(dispatch(ConnectorError::io("connection reset".into())).is_retryable());
+        assert!(dispatch(ConnectorError::timeout("read timed out".into())).is_retryable());
     }
 
     #[test]

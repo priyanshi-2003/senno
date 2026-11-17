@@ -198,14 +198,11 @@ async fn a_tool_failure_reaches_the_model_but_not_the_client() {
 #[tokio::test]
 async fn a_metered_turn_bills_the_session_and_the_done_frame_names_only_the_session() {
     let mut session = AgentSession::new("s1", "commerce");
-    let usage = Usage {
-        input_tokens: Some(100),
-        cached_input_tokens: None,
-        cache_write_input_tokens: None,
-        output_tokens: Some(20),
-        reasoning_tokens: Some(30),
-        total_tokens: Some(150),
-    };
+    let mut usage = Usage::default();
+    usage.input_tokens = Some(100);
+    usage.output_tokens = Some(20);
+    usage.reasoning_tokens = Some(30);
+    usage.total_tokens = Some(150);
     let rounds = vec![Round::Chunks(vec![text("hi"), done(Some(usage))])];
     let events = run(Scripted::new(rounds), &mut session).await;
 

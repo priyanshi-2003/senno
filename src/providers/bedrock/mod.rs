@@ -13,9 +13,9 @@ mod document;
 mod embed;
 mod error;
 mod stream;
+mod types;
 
-pub use client::BedrockClient;
-pub use config::{BedrockConfig, BedrockGuardrail};
+pub use types::{BedrockClient, BedrockConfig, BedrockGuardrail};
 
 use crate::error::Error;
 

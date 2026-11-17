@@ -238,9 +238,15 @@ let client = get_bedrock_client(Some(
 ))
 .await?;
 
+// Recent Claude models are on-demand only through an inference profile, so
+// pass the profile id (`global.` / `eu.` prefix), not the bare model id.
 let resp = one_shot(
     &client,
-    &GenerateRequest::one_shot("anthropic.claude-sonnet-5", "You are terse.", "Hi")
+    &GenerateRequest::one_shot(
+        "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "You are terse.",
+        "Hi",
+    )
         .with_max_tokens(512),
 )
 .await?;

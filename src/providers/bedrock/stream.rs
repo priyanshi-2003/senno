@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use aws_sdk_bedrockruntime::error::ProvideErrorMetadata;
 use aws_sdk_bedrockruntime::types::{
     ContentBlockDelta, ContentBlockStart, ConverseStreamOutput, error::ConverseStreamOutputError,
 };
@@ -12,7 +11,7 @@ use crate::provider::LlmStream;
 use crate::types::{StreamChunk, Usage};
 
 use super::converse::to_usage;
-use super::error::{from_code, from_sdk};
+use super::error::{PROVIDER, from_sdk};
 
 type Receiver = aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver<
     ConverseStreamOutput,
@@ -80,13 +79,20 @@ impl StreamState {
 
     /// Call when the event stream ends. Flushes tool calls whose block never
     /// closed and emits `Done` if the metadata event never came.
-    pub(super) fn finish(&mut self) -> Vec<StreamChunk> {
-        let mut chunks: Vec<StreamChunk> = std::mem::take(&mut self.tools)
-            .into_values()
-            .map(finish_tool)
-            .collect();
+    pub(super) fn finish(&mut self) -> Result<Vec<StreamChunk>, Error> {
+        let pending = std::mem::take(&mut self.tools);
+        if self.stop_reason.is_none() {
+            return Err(Error::provider(
+                PROVIDER,
+                format!(
+                    "ConverseStream ended before messageStop; dropped {} unfinished tool call(s)",
+                    pending.len()
+                ),
+            ));
+        }
+        let mut chunks: Vec<StreamChunk> = pending.into_values().map(finish_tool).collect();
         chunks.extend(self.done(None));
-        chunks
+        Ok(chunks)
     }
 
     fn done(&mut self, usage: Option<Usage>) -> Vec<StreamChunk> {
@@ -132,33 +138,23 @@ pub(super) fn into_chunks(mut receiver: Receiver) -> LlmStream {
                     }
                 }
                 Ok(None) => {
-                    for chunk in state.finish() {
-                        yield Ok(chunk);
+                    match state.finish() {
+                        Ok(chunks) => {
+                            for chunk in chunks {
+                                yield Ok(chunk);
+                            }
+                        }
+                        Err(err) => yield Err(err),
                     }
                     break;
                 }
                 Err(err) => {
-                    yield Err(stream_error(err));
+                    yield Err(from_sdk("ConverseStream", err));
                     break;
                 }
             }
         }
     })
-}
-
-fn stream_error(
-    err: aws_sdk_bedrockruntime::error::SdkError<
-        ConverseStreamOutputError,
-        aws_smithy_types::event_stream::RawMessage,
-    >,
-) -> Error {
-    match &err {
-        aws_sdk_bedrockruntime::error::SdkError::ServiceError(service) => {
-            let e = service.err();
-            from_code("ConverseStream", e.code(), e.message())
-        }
-        _ => from_sdk("ConverseStream", err),
-    }
 }
 
 #[cfg(test)]
@@ -241,12 +237,16 @@ mod tests {
         )
     }
 
-    fn run(events: Vec<ConverseStreamOutput>) -> Vec<StreamChunk> {
+    fn run_raw(events: Vec<ConverseStreamOutput>) -> Result<Vec<StreamChunk>, Error> {
         let mut state = StreamState::default();
         let mut chunks: Vec<StreamChunk> =
             events.into_iter().flat_map(|e| state.on_event(e)).collect();
-        chunks.extend(state.finish());
-        chunks
+        chunks.extend(state.finish()?);
+        Ok(chunks)
+    }
+
+    fn run(events: Vec<ConverseStreamOutput>) -> Vec<StreamChunk> {
+        run_raw(events).expect("stream should finish cleanly")
     }
 
     #[test]
@@ -298,7 +298,11 @@ mod tests {
 
     #[test]
     fn tool_with_no_input_gets_empty_object() {
-        let chunks = run(vec![tool_start(0, "t", "get_cart"), stop(0)]);
+        let chunks = run(vec![
+            tool_start(0, "t", "get_cart"),
+            stop(0),
+            message_stop(StopReason::ToolUse),
+        ]);
         assert!(matches!(&chunks[0], StreamChunk::ToolCall { arguments, .. }
             if arguments == &serde_json::json!({})));
     }
@@ -313,10 +317,31 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_tool_block_is_flushed_at_end() {
+    fn cut_off_stream_is_a_retryable_error_without_tool_calls() {
+        let mut state = StreamState::default();
+        let mut chunks = Vec::new();
+        for event in [
+            text(0, "Searching"),
+            tool_start(1, "t", "search"),
+            tool_delta(1, r#"{"q":"#),
+        ] {
+            chunks.extend(state.on_event(event));
+        }
+        let err = state.finish().unwrap_err();
+        assert!(err.is_retryable(), "{err}");
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::ToolCall { .. } | StreamChunk::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn unclosed_tool_block_after_message_stop_is_flushed() {
         let chunks = run(vec![
             tool_start(0, "t", "search"),
             tool_delta(0, r#"{"q":1}"#),
+            message_stop(StopReason::ToolUse),
         ]);
         assert!(matches!(&chunks[0], StreamChunk::ToolCall { name, .. } if name == "search"));
         assert!(matches!(&chunks[1], StreamChunk::Done { .. }));
