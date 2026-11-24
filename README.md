@@ -22,6 +22,7 @@ shipping its own.
 | `vertex` | `VertexClient`: Gemini + Anthropic (Claude) on Vertex AI. API-key auth (Gemini) or service-account auth (both), token caching, streaming SSE parsing, Gemini thinking-model `thoughtSignature` handling, Gemini text embeddings via `EmbeddingProvider`, async bulk generation and bulk embedding at half price via `BatchGenerationProvider` / `BatchEmbeddingProvider`. |
 | `batch` | `run_batch` / `run_embedding_batch` — submit a batch job and poll it to completion. Enabled by `vertex`. |
 | `axum` | `agent::to_sse_event` — map agent events straight into `axum::response::sse`. |
+| `bedrock` | `BedrockClient`: Amazon Bedrock. Chat through the Converse API (Claude, GPT and any other Converse model) with tools, streaming, token usage and an optional Bedrock Guardrail on every call; embeddings via `EmbeddingProvider` for Titan (Text v1/v2, Multimodal G1), Cohere Embed v4 (multilingual, text + image together, batched) and Nova Multimodal Embeddings (multilingual, text or image). Credentials from the AWS default chain, so IRSA on EKS needs no keys. |
 | `mcp` | `mcp::{McpServer, McpToolset}` — register foreign [MCP](https://modelcontextprotocol.io) servers as a `ToolSource`; the engine offers their tools alongside your flow's own and routes calls to whichever owns the name. See [docs/mcp](docs/mcp/README.md). |
 
 ## Quick start
@@ -221,6 +222,80 @@ rounds, session state, and — when history exceeds your configured limit —
 compacts older turns into an LLM-written summary at a safe message boundary
 (tool-call/result pairs are never split; on compactor failure it degrades to
 plain truncation).
+
+### Amazon Bedrock (feature `bedrock`)
+
+```rust
+use senno::providers::bedrock::{BedrockConfig, BedrockGuardrail, get_bedrock_client};
+use senno::{EmbedImage, EmbedRequest, EmbedTaskType, EmbeddingProvider, GenerateRequest, one_shot};
+
+// Region from with_region, then the region in with_sdk_config, then
+// BEDROCK_REGION / AWS_REGION; credentials from the AWS default
+// chain (IRSA web identity on EKS, instance role, profile).
+let client = get_bedrock_client(Some(
+    BedrockConfig::default()
+        .with_region("eu-central-1")
+        .with_guardrail(BedrockGuardrail::new("gr-abc123", "1")),
+))
+.await?;
+
+// Recent Claude models are on-demand only through an inference profile, so
+// pass the profile id (`global.` / `eu.` prefix), not the bare model id.
+let resp = one_shot(
+    &client,
+    &GenerateRequest::one_shot(
+        "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "You are terse.",
+        "Hi",
+    )
+        .with_max_tokens(512),
+)
+.await?;
+
+// Cohere Embed v4: multilingual, a text and its image become one vector.
+let vectors = client
+    .embed(
+        &EmbedRequest::new("cohere.embed-v4:0", ["pantofi sport roșii"])
+            .with_images([EmbedImage::new(std::fs::read("shoe.jpg")?)])
+            .with_task_type(EmbedTaskType::RetrievalDocument)
+            .with_output_dimensionality(1024),
+    )
+    .await?;
+```
+
+| Embedding model | Model id | Inputs per item | Languages | Dimensions |
+|---|---|---|---|---|
+| Titan Text v2 | `amazon.titan-embed-text-v2:0` | text | multilingual | 256, 512, 1024 |
+| Titan Multimodal G1 | `amazon.titan-embed-image-v1` | text and/or image | English | 256, 384, 1024 |
+| Cohere Embed v4 | `cohere.embed-v4:0` (or `eu.` / `global.`) | text, image, or both; 96 per call | 100+ | 256, 512, 1024, 1536 |
+| Nova Multimodal | `amazon.nova-2-multimodal-embeddings-v1:0` | text **or** image | 200+ | 256, 384, 1024, 3072 |
+
+`EmbedTaskType::RetrievalDocument` (the default) indexes content and
+`RetrievalQuery` embeds search queries; senno maps them to Cohere's
+`input_type` and Nova's `embeddingPurpose`. Image formats are detected from the
+bytes (PNG, JPEG, GIF, WebP).
+
+`BedrockClient` implements `LlmProvider`, so it drops into `get_agent_engine`
+unchanged. Notes:
+
+- `max_tokens` defaults to 4096 when unset: Bedrock reserves
+  `input + max_tokens` against the model's tokens-per-minute quota at the start
+  of every call, so keep it close to the answers you expect.
+- `top_k` is sent only to Anthropic models; other models ignore it with a
+  warning.
+- Throttling, model-not-ready and transient server errors are retried by the
+  AWS SDK (3 attempts by default, `with_max_attempts`) and then surface as
+  retryable `senno::Error`s; validation and access errors are permanent. The
+  SDK is the retry layer: callers should not retry the same call again, or
+  should set `with_max_attempts(1)` and retry themselves.
+- Every call has a 5 s connect timeout and a read timeout (60 s by default,
+  `with_timeout`): a reply that sends nothing for that long, before it starts
+  or between two streamed events, fails as a retryable error. A non-streaming Converse call sends nothing until the whole
+  answer is ready, so long answers need streaming or a longer timeout.
+- Token usage maps cache reads to `cached_input_tokens`; cache reads and
+  writes are both included in `input_tokens`.
+- Not yet supported on Bedrock: `thinking_budget` (ignored with a warning) and
+  images inside chat messages (needs a new `ContentPart` variant).
 
 ## Errors
 

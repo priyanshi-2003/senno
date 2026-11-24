@@ -102,6 +102,7 @@ impl AgentEngine {
                 let mut full_text = String::new();
                 let mut got_tool_call = false;
                 let mut usage_seen = false;
+                let turn_start = session.messages.len();
 
                 futures::pin_mut!(chunk_stream);
                 while let Some(chunk) = futures::StreamExt::next(&mut chunk_stream).await {
@@ -203,9 +204,12 @@ impl AgentEngine {
                 }
 
                 if !full_text.is_empty() {
-                    session.messages.push(ChatMessage::Assistant {
-                        content: full_text,
-                    });
+                    session.messages.insert(
+                        turn_start,
+                        ChatMessage::Assistant {
+                            content: full_text,
+                        },
+                    );
                 }
 
                 if got_tool_call {
@@ -310,11 +314,11 @@ pub struct CompactionResult {
     pub usage: Option<Usage>,
 }
 
-/// Bring `messages.len()` down to `max`. If a compactor is configured, split at
-/// the nearest `User` boundary ≥ the ideal cut and replace the head with the
-/// compactor's summary (so tool-call/result pairs stay intact). Otherwise, or
-/// on compactor failure, drop the head outright, then strip any leading
-/// `ToolResult` so the model never sees an orphan.
+/// Bring `messages.len()` down to `max`, always cutting at a `User` message so
+/// the history starts with the user and every tool call keeps its result. If a
+/// compactor is configured, the dropped head is replaced by its summary. When
+/// the current turn alone is longer than `max`, its oldest tool-call/result
+/// pairs are dropped and its `User` message is kept.
 async fn compact_or_truncate(
     messages: &mut Vec<ChatMessage>,
     max: usize,
@@ -367,7 +371,6 @@ async fn compact_or_truncate(
                     error = %e,
                     "history compactor failed; falling back to raw truncation",
                 );
-                strip_orphan_tool_results_head(messages);
                 let after_len = messages.len();
                 return Some(CompactionResult {
                     strategy: "truncate",
@@ -383,15 +386,24 @@ async fn compact_or_truncate(
         }
     }
 
-    // No compactor, or no valid split: raw truncate.
-    messages.drain(..ideal);
-    strip_orphan_tool_results_head(messages);
+    let split = find_user_split(messages, ideal)
+        .or_else(|| {
+            messages
+                .iter()
+                .rposition(|m| matches!(m, ChatMessage::User { .. }))
+        })
+        .unwrap_or(0);
+    messages.drain(..split);
+    let removed = split + trim_current_turn(messages, max);
+    if removed == 0 {
+        return None;
+    }
     let after_len = messages.len();
     Some(CompactionResult {
         strategy: "truncate",
         messages_before: before_len,
         messages_after: after_len,
-        summarized: ideal,
+        summarized: removed,
         summary: None,
         elapsed_ms: start.elapsed().as_millis() as u64,
         model: None,
@@ -403,10 +415,18 @@ fn find_user_split(messages: &[ChatMessage], ideal: usize) -> Option<usize> {
     (ideal..messages.len()).find(|&i| matches!(&messages[i], ChatMessage::User { .. }))
 }
 
-fn strip_orphan_tool_results_head(messages: &mut Vec<ChatMessage>) {
-    while matches!(messages.first(), Some(ChatMessage::ToolResult { .. })) {
-        messages.remove(0);
+fn trim_current_turn(messages: &mut Vec<ChatMessage>, max: usize) -> usize {
+    if messages.len() <= max || !matches!(messages.first(), Some(ChatMessage::User { .. })) {
+        return 0;
     }
+    let earliest = (messages.len() + 1).saturating_sub(max).max(1);
+    let Some(cut) = (earliest..messages.len())
+        .find(|&i| !matches!(messages.get(i), Some(ChatMessage::ToolResult { .. })))
+    else {
+        return 0;
+    };
+    messages.drain(1..cut);
+    cut - 1
 }
 
 #[cfg(test)]
@@ -488,11 +508,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_truncate_strips_orphan_tool_result() {
-        let mut msgs = vec![user("a"), tc("1"), tr("1"), assistant("b")];
-        compact_or_truncate(&mut msgs, 2, None).await;
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], ChatMessage::Assistant { .. }));
+    async fn raw_truncate_cuts_at_a_user_message() {
+        let mut msgs = vec![user("a"), tc("1"), tr("1"), user("b"), assistant("c")];
+        compact_or_truncate(&mut msgs, 3, None).await;
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], ChatMessage::User { content } if content == "b"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_current_turn_drops_its_oldest_tool_rounds() {
+        let mut msgs = vec![
+            user("a"),
+            assistant("b"),
+            user("c"),
+            tc("1"),
+            tr("1"),
+            tc("2"),
+            tr("2"),
+        ];
+        let result = compact_or_truncate(&mut msgs, 3, None).await.unwrap();
+        assert_eq!(result.summarized, 4);
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[0], ChatMessage::User { content } if content == "c"));
+        assert!(matches!(&msgs[1], ChatMessage::ToolCall { id, .. } if id == "2"));
+        assert!(
+            matches!(&msgs[2], ChatMessage::ToolResult { tool_call_id, .. } if tool_call_id == "2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_oversized_turn_keeps_its_user_message() {
+        let mut msgs = vec![user("a"), tc("1"), tr("1"), tc("2"), tr("2")];
+        compact_or_truncate(&mut msgs, 3, None).await;
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[0], ChatMessage::User { content } if content == "a"));
+        assert!(matches!(&msgs[1], ChatMessage::ToolCall { id, .. } if id == "2"));
+    }
+
+    #[tokio::test]
+    async fn a_trim_that_would_orphan_a_tool_result_is_skipped() {
+        let mut msgs = vec![user("a"), tc("1"), tr("1"), tc("2"), tr("2")];
+        assert!(compact_or_truncate(&mut msgs, 2, None).await.is_none());
+        assert_eq!(msgs.len(), 5);
     }
 
     #[tokio::test]

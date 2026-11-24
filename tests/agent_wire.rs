@@ -196,6 +196,31 @@ async fn a_tool_failure_reaches_the_model_but_not_the_client() {
 }
 
 #[tokio::test]
+async fn text_said_before_a_tool_call_is_saved_before_it() {
+    let mut session = AgentSession::new("s1", "commerce");
+    let rounds = vec![
+        Round::Chunks(vec![text("Looking now."), tool_call(), done(None)]),
+        Round::Chunks(vec![text("Found it."), done(None)]),
+    ];
+    run(Scripted::new(rounds), &mut session).await;
+
+    let kinds: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|message| match message {
+            ChatMessage::User { .. } => "user",
+            ChatMessage::Assistant { .. } => "assistant",
+            ChatMessage::ToolCall { .. } => "tool_call",
+            ChatMessage::ToolResult { .. } => "tool_result",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["user", "assistant", "tool_call", "tool_result", "assistant"]
+    );
+}
+
+#[tokio::test]
 async fn a_metered_turn_bills_the_session_and_the_done_frame_names_only_the_session() {
     let mut session = AgentSession::new("s1", "commerce");
     let usage = Usage {

@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::providers::render_tool_content;
 use crate::types::{
     ContentPart, GenerateRequest, GenerateResponse, ParameterSchema, Role, StreamChunk, Usage,
 };
@@ -296,20 +297,10 @@ fn to_blocks(parts: &[ContentPart]) -> Vec<ContentBlock> {
                 ..
             } => ContentBlock::ToolResult {
                 tool_use_id: tool_call_id.clone(),
-                content: value_to_tool_result_string(content),
+                content: render_tool_content(content),
             },
         })
         .collect()
-}
-
-/// Anthropic's `tool_result.content` is a raw string. If our canonical content is
-/// a JSON string, unwrap it (`Value::String("hi")` → `hi`). Any other JSON value
-/// is serialized as-is so the model sees valid JSON.
-fn value_to_tool_result_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
 }
 
 fn from_wire(resp: Response) -> GenerateResponse {
@@ -513,13 +504,13 @@ mod tests {
     #[test]
     fn value_to_tool_result_string_unwraps_json_string() {
         let v = serde_json::Value::String("hello".into());
-        assert_eq!(value_to_tool_result_string(&v), "hello");
+        assert_eq!(render_tool_content(&v), "hello");
     }
 
     #[test]
     fn value_to_tool_result_string_serializes_object() {
         let v = serde_json::json!({"count": 3});
-        let out = value_to_tool_result_string(&v);
+        let out = render_tool_content(&v);
         assert!(out.contains("\"count\""));
         assert!(out.contains("3"));
     }

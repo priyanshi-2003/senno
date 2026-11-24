@@ -283,10 +283,30 @@ pub enum StreamChunk {
 pub struct EmbedRequest {
     pub model: String,
     pub texts: Vec<String>,
+    pub images: Vec<EmbedImage>,
     pub task_type: Option<EmbedTaskType>,
     pub output_dimensionality: Option<u32>,
     pub title: Option<String>,
     pub api: Option<EmbedApi>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct EmbedImage {
+    pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for EmbedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedImage")
+            .field("len", &self.data.len())
+            .finish()
+    }
+}
+
+impl EmbedImage {
+    pub fn new(data: impl Into<Vec<u8>>) -> Self {
+        Self { data: data.into() }
+    }
 }
 
 /// Vertex serves embeddings through two disjoint APIs, and a model speaks exactly one of them.
@@ -308,6 +328,7 @@ impl EmbedRequest {
         Self {
             model: model.into(),
             texts: texts.into_iter().map(|t| t.into()).collect(),
+            images: Vec::new(),
             task_type: None,
             output_dimensionality: None,
             title: None,
@@ -317,6 +338,22 @@ impl EmbedRequest {
 
     pub fn single(model: impl Into<String>, text: impl Into<String>) -> Self {
         Self::new(model, [text.into()])
+    }
+
+    pub fn from_images(
+        model: impl Into<String>,
+        images: impl IntoIterator<Item = EmbedImage>,
+    ) -> Self {
+        Self::new(model, Vec::<String>::new()).with_images(images)
+    }
+
+    pub fn with_images(mut self, images: impl IntoIterator<Item = EmbedImage>) -> Self {
+        self.images = images.into_iter().collect();
+        self
+    }
+
+    pub fn item_count(&self) -> usize {
+        self.texts.len().max(self.images.len())
     }
 
     pub fn with_task_type(mut self, v: EmbedTaskType) -> Self {
