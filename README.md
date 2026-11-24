@@ -288,10 +288,30 @@ unchanged. Notes:
   `with_timeout`): a reply that sends nothing for that long fails as a
   retryable error. A non-streaming Converse call sends nothing until the whole
   answer is ready, so long answers need streaming or a longer timeout.
-- Token usage maps cache reads to `cached_input_tokens`; cache reads and
-  writes are both included in `input_tokens`.
+- Token usage maps cache reads to `cached_input_tokens` and cache writes to
+  `cache_write_input_tokens`; both are included in `input_tokens`.
 - Not yet supported on Bedrock: `thinking_budget` (ignored with a warning) and
   images inside chat messages (needs a new `ContentPart` variant).
+
+### Prompt caching
+
+Every call of an agent turn resends the same tools, system prompt and history.
+`with_prompt_cache(true)` on a `GenerateRequest` (or `prompt_cache: true` in
+the agent's `GenerationParams`) asks the provider to cache that prefix:
+
+| Provider | What senno sends |
+|---|---|
+| Bedrock (Converse) | a `cachePoint` after the system prompt (after the tools when there is none) and after the last message |
+| Claude on Vertex | `cache_control: ephemeral` on the same two places |
+| Gemini on Vertex | nothing; Gemini caches repeated prefixes on its own |
+
+The cache lives with the provider for about five minutes after its last use.
+Cache writes cost a little more than normal input and cache reads much less, so
+it pays off when the same prefix is sent again within that window, as it is on
+every round of a tool loop. Prefixes below the model's minimum length are not
+cached. On Bedrock, only enable it for models that support prompt caching.
+`Usage` reports `cached_input_tokens` (reads) and `cache_write_input_tokens`
+(writes), and the agent's session meter adds both up.
 
 ## Errors
 

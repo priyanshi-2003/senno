@@ -84,13 +84,12 @@ impl AgentFlow for OneToolFlow {
 }
 
 fn usage(input: u32, output: u32, reasoning: u32, total: u32) -> Usage {
-    Usage {
-        input_tokens: Some(input),
-        cached_input_tokens: None,
-        output_tokens: Some(output),
-        reasoning_tokens: Some(reasoning),
-        total_tokens: Some(total),
-    }
+    let mut usage = Usage::default();
+    usage.input_tokens = Some(input);
+    usage.output_tokens = Some(output);
+    usage.reasoning_tokens = Some(reasoning);
+    usage.total_tokens = Some(total);
+    usage
 }
 
 fn done(usage: Option<Usage>) -> StreamChunk {

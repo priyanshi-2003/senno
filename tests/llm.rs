@@ -116,12 +116,11 @@ fn stub(content: Vec<ContentPart>, usage: Option<Usage>) -> StubProvider {
 }
 
 fn usage() -> Usage {
-    Usage {
-        input_tokens: Some(10),
-        output_tokens: Some(5),
-        total_tokens: Some(15),
-        ..Usage::default()
-    }
+    let mut usage = Usage::default();
+    usage.input_tokens = Some(10);
+    usage.output_tokens = Some(5);
+    usage.total_tokens = Some(15);
+    usage
 }
 
 fn tool_call(name: &str, args: serde_json::Value) -> ContentPart {

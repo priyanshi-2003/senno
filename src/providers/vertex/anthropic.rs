@@ -15,7 +15,7 @@ struct Request {
     max_tokens: u32,
     messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<WireSystem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<WireToolDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,22 +41,68 @@ enum WireContent {
     Blocks(Vec<ContentBlock>),
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireSystem {
+    Text(String),
+    Blocks(Vec<SystemBlock>),
+}
+
+#[derive(Serialize)]
+struct SystemBlock {
+    r#type: &'static str,
+    text: String,
+    cache_control: CacheControl,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheControl {
+    r#type: CacheType,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CacheType {
+    Ephemeral,
+}
+
+const EPHEMERAL: CacheControl = CacheControl {
+    r#type: CacheType::Ephemeral,
+};
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum ContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
+}
+
+impl ContentBlock {
+    fn mark_cached(&mut self) {
+        let (ContentBlock::Text { cache_control, .. }
+        | ContentBlock::ToolUse { cache_control, .. }
+        | ContentBlock::ToolResult { cache_control, .. }) = self;
+        *cache_control = Some(EPHEMERAL);
+    }
 }
 
 #[derive(Serialize)]
@@ -64,6 +110,8 @@ struct WireToolDef {
     name: String,
     description: String,
     input_schema: ParameterSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +138,7 @@ impl From<WireUsage> for Usage {
         Usage {
             input_tokens: input,
             cached_input_tokens: u.cache_read_input_tokens,
+            cache_write_input_tokens: u.cache_creation_input_tokens,
             output_tokens: u.output_tokens,
             reasoning_tokens: None,
             total_tokens: sum_opt(input, u.output_tokens),
@@ -111,6 +160,7 @@ fn merge_usage(prev: Option<Usage>, next: Usage) -> Usage {
     Usage {
         input_tokens,
         cached_input_tokens: next.cached_input_tokens.or(p.cached_input_tokens),
+        cache_write_input_tokens: next.cache_write_input_tokens.or(p.cache_write_input_tokens),
         output_tokens,
         reasoning_tokens: None,
         total_tokens: sum_opt(input_tokens, output_tokens),
@@ -232,7 +282,7 @@ fn to_wire(req: &GenerateRequest) -> Request {
         );
     }
 
-    let messages = req
+    let mut messages: Vec<WireMessage> = req
         .messages
         .iter()
         .map(|m| WireMessage {
@@ -257,16 +307,37 @@ fn to_wire(req: &GenerateRequest) -> Request {
                     name: t.name.clone(),
                     description: t.description.clone(),
                     input_schema: t.parameters.clone(),
+                    cache_control: None,
                 })
                 .collect(),
         )
     };
 
+    let mut tools: Option<Vec<WireToolDef>> = tools;
+    let system = match req.system.clone() {
+        Some(text) if req.prompt_cache => Some(WireSystem::Blocks(vec![SystemBlock {
+            r#type: "text",
+            text,
+            cache_control: EPHEMERAL,
+        }])),
+        other => {
+            if req.prompt_cache
+                && let Some(last) = tools.as_mut().and_then(|t| t.last_mut())
+            {
+                last.cache_control = Some(EPHEMERAL);
+            }
+            other.map(WireSystem::Text)
+        }
+    };
+    if req.prompt_cache {
+        mark_last_message(&mut messages);
+    }
+
     Request {
         anthropic_version: "vertex-2023-10-16".into(),
         max_tokens: req.max_tokens.unwrap_or(4096),
         messages,
-        system: req.system.clone(),
+        system,
         tools,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -275,11 +346,31 @@ fn to_wire(req: &GenerateRequest) -> Request {
     }
 }
 
+fn mark_last_message(messages: &mut [WireMessage]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    if let WireContent::Text(text) = &mut last.content {
+        last.content = WireContent::Blocks(vec![ContentBlock::Text {
+            text: std::mem::take(text),
+            cache_control: None,
+        }]);
+    }
+    if let WireContent::Blocks(blocks) = &mut last.content
+        && let Some(block) = blocks.last_mut()
+    {
+        block.mark_cached();
+    }
+}
+
 fn to_blocks(parts: &[ContentPart]) -> Vec<ContentBlock> {
     parts
         .iter()
         .map(|p| match p {
-            ContentPart::Text(text) => ContentBlock::Text { text: text.clone() },
+            ContentPart::Text(text) => ContentBlock::Text {
+                text: text.clone(),
+                cache_control: None,
+            },
             ContentPart::ToolCall {
                 id,
                 name,
@@ -289,6 +380,7 @@ fn to_blocks(parts: &[ContentPart]) -> Vec<ContentBlock> {
                 id: id.clone(),
                 name: name.clone(),
                 input: arguments.clone(),
+                cache_control: None,
             },
             ContentPart::ToolResult {
                 tool_call_id,
@@ -297,6 +389,7 @@ fn to_blocks(parts: &[ContentPart]) -> Vec<ContentBlock> {
             } => ContentBlock::ToolResult {
                 tool_use_id: tool_call_id.clone(),
                 content: value_to_tool_result_string(content),
+                cache_control: None,
             },
         })
         .collect()
@@ -317,8 +410,10 @@ fn from_wire(resp: Response) -> GenerateResponse {
         .content
         .into_iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => ContentPart::Text(text),
-            ContentBlock::ToolUse { id, name, input } => ContentPart::ToolCall {
+            ContentBlock::Text { text, .. } => ContentPart::Text(text),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => ContentPart::ToolCall {
                 id,
                 name,
                 arguments: input,
@@ -502,6 +597,61 @@ mod tests {
     }
 
     use super::*;
+
+    fn cached_request() -> GenerateRequest {
+        GenerateRequest::new(
+            "m",
+            vec![
+                crate::types::Message::user("red shoes"),
+                crate::types::Message::assistant("Here you go."),
+                crate::types::Message::user("cheaper ones?"),
+            ],
+        )
+        .with_tools(vec![crate::types::ToolDefinition::new("search", "Search")])
+        .with_prompt_cache(true)
+    }
+
+    #[test]
+    fn prompt_cache_marks_the_system_prompt_and_the_last_message() {
+        let req = cached_request().with_system("You are a shop assistant.");
+        let json = serde_json::to_value(to_wire(&req)).unwrap();
+        assert_eq!(
+            json["system"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "You are a shop assistant.",
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
+        assert!(json["tools"][0].get("cache_control").is_none());
+        assert_eq!(json["messages"][0]["content"], "red shoes");
+        assert_eq!(
+            json["messages"][2]["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "cheaper ones?",
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
+    }
+
+    #[test]
+    fn prompt_cache_marks_the_tools_when_there_is_no_system_prompt() {
+        let json = serde_json::to_value(to_wire(&cached_request())).unwrap();
+        assert!(json.get("system").is_none());
+        assert_eq!(
+            json["tools"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn no_cache_control_without_prompt_cache() {
+        let req = cached_request().with_system("sys").with_prompt_cache(false);
+        let json = serde_json::to_value(to_wire(&req)).unwrap();
+        assert_eq!(json["system"], "sys");
+        assert!(!json.to_string().contains("cache_control"));
+    }
 
     #[test]
     fn web_fetch_is_dropped_rather_than_sent_to_anthropic() {

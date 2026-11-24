@@ -103,6 +103,7 @@ pub struct GenerationParams {
     pub top_k: Option<u32>,
     pub max_tokens: Option<u32>,
     pub thinking_budget: Option<u32>,
+    pub prompt_cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,7 @@ pub struct GenerateRequest {
     pub thinking_budget: Option<u32>,
     /// Providers without a built-in fetcher ignore this.
     pub web_fetch: bool,
+    pub prompt_cache: bool,
     pub tools: Vec<ToolDefinition>,
 }
 
@@ -132,6 +134,7 @@ impl GenerateRequest {
             top_k: None,
             thinking_budget: None,
             web_fetch: false,
+            prompt_cache: false,
             tools: Vec::new(),
         }
     }
@@ -161,6 +164,9 @@ impl GenerateRequest {
         }
         if let Some(v) = params.thinking_budget {
             self.thinking_budget = Some(v);
+        }
+        if params.prompt_cache {
+            self.prompt_cache = true;
         }
         self
     }
@@ -197,6 +203,11 @@ impl GenerateRequest {
 
     pub fn with_web_fetch(mut self, enabled: bool) -> Self {
         self.web_fetch = enabled;
+        self
+    }
+
+    pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
+        self.prompt_cache = enabled;
         self
     }
 
@@ -254,9 +265,11 @@ impl GenerateResponse {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Usage {
     pub input_tokens: Option<u32>,
     pub cached_input_tokens: Option<u32>,
+    pub cache_write_input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub reasoning_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
@@ -1022,6 +1035,7 @@ mod tests {
             top_k: Some(40),
             max_tokens: Some(256),
             thinking_budget: Some(1024),
+            prompt_cache: true,
         };
         let req = GenerateRequest::new("m", vec![]).with_params(params);
         assert_eq!(req.temperature, Some(0.5));
@@ -1029,6 +1043,7 @@ mod tests {
         assert_eq!(req.top_k, Some(40));
         assert_eq!(req.max_tokens, Some(256));
         assert_eq!(req.thinking_budget, Some(1024));
+        assert!(req.prompt_cache);
     }
 
     #[test]
@@ -1038,5 +1053,6 @@ mod tests {
             .with_params(GenerationParams::default());
         assert_eq!(req.max_tokens, Some(99));
         assert_eq!(req.temperature, None);
+        assert!(!req.prompt_cache);
     }
 }

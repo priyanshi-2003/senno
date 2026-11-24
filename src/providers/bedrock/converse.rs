@@ -29,23 +29,34 @@ pub(super) fn to_converse(request: &GenerateRequest) -> Result<ConverseParts, Er
         tracing::warn!("thinking_budget is not supported on Bedrock yet and is ignored");
     }
 
-    let system = request
+    let mut system = request
         .system
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|s| vec![bt::SystemContentBlock::Text(s.to_string())])
         .unwrap_or_default();
+    let cache_tools = request.prompt_cache && system.is_empty();
+    if request.prompt_cache && !system.is_empty() {
+        system.push(bt::SystemContentBlock::CachePoint(build_cache_point()?));
+    }
 
     Ok(ConverseParts {
         system,
-        messages: to_messages(&request.messages)?,
+        messages: to_messages(&request.messages, request.prompt_cache)?,
         inference: build_inference_config(request),
-        tools: build_tool_config(request)?,
+        tools: build_tool_config(request, cache_tools)?,
         additional_fields: build_additional_fields(request),
     })
 }
 
-fn to_messages(messages: &[Message]) -> Result<Vec<bt::Message>, Error> {
+fn build_cache_point() -> Result<bt::CachePointBlock, Error> {
+    bt::CachePointBlock::builder()
+        .r#type(bt::CachePointType::Default)
+        .build()
+        .map_err(|e| Error::internal(format!("bedrock cache point build failed: {e}")))
+}
+
+fn to_messages(messages: &[Message], prompt_cache: bool) -> Result<Vec<bt::Message>, Error> {
     let mut merged: Vec<(Role, Vec<bt::ContentBlock>)> = Vec::new();
     for message in messages {
         let mut role = message.role;
@@ -71,6 +82,10 @@ fn to_messages(messages: &[Message]) -> Result<Vec<bt::Message>, Error> {
             Some((last_role, last_blocks)) if *last_role == role => last_blocks.extend(blocks),
             _ => merged.push((role, blocks)),
         }
+    }
+
+    if prompt_cache && let Some((_, blocks)) = merged.last_mut() {
+        blocks.push(bt::ContentBlock::CachePoint(build_cache_point()?));
     }
 
     merged
@@ -156,11 +171,14 @@ fn build_inference_config(request: &GenerateRequest) -> Option<bt::InferenceConf
     )
 }
 
-fn build_tool_config(request: &GenerateRequest) -> Result<Option<bt::ToolConfiguration>, Error> {
+fn build_tool_config(
+    request: &GenerateRequest,
+    cache: bool,
+) -> Result<Option<bt::ToolConfiguration>, Error> {
     if request.tools.is_empty() {
         return Ok(None);
     }
-    let tools = request
+    let mut tools = request
         .tools
         .iter()
         .map(|tool| {
@@ -178,6 +196,9 @@ fn build_tool_config(request: &GenerateRequest) -> Result<Option<bt::ToolConfigu
                 .map_err(|e| Error::internal(format!("bedrock tool spec build failed: {e}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if cache {
+        tools.push(bt::Tool::CachePoint(build_cache_point()?));
+    }
 
     bt::ToolConfiguration::builder()
         .set_tools(Some(tools))
@@ -232,6 +253,7 @@ pub(super) fn to_usage(usage: &bt::TokenUsage) -> Usage {
     Usage {
         input_tokens: Some(input),
         cached_input_tokens: cache_read,
+        cache_write_input_tokens: cache_write,
         output_tokens: Some(output),
         reasoning_tokens: None,
         total_tokens: Some(to_u32(usage.total_tokens()).max(input.saturating_add(output))),
@@ -333,7 +355,7 @@ mod tests {
             Message::assistant("Here are three."),
             Message::tool_call("t2", "recommend", json!({"ids": ["a"]})),
         ];
-        let messages = to_messages(&history).unwrap();
+        let messages = to_messages(&history, false).unwrap();
         assert_eq!(
             roles(&messages),
             vec![
@@ -354,7 +376,7 @@ mod tests {
             Message::assistant("They wanted shoes."),
             Message::user("cheaper?"),
         ];
-        let messages = to_messages(&history).unwrap();
+        let messages = to_messages(&history, false).unwrap();
         assert_eq!(roles(&messages), vec![bt::ConversationRole::User]);
         let blocks = messages[0].content();
         assert!(matches!(&blocks[0], bt::ContentBlock::Text(t)
@@ -369,7 +391,7 @@ mod tests {
             Message::user("hi"),
             Message::tool_result("t1", "noop", json!("")),
         ];
-        let messages = to_messages(&history).unwrap();
+        let messages = to_messages(&history, false).unwrap();
         let blocks = messages[0].content();
         assert_eq!(blocks.len(), 2);
         match &blocks[1] {
@@ -389,7 +411,7 @@ mod tests {
             Message::tool_call("t1", "search", json!({"q": "shoes", "limit": 5})),
             Message::tool_result("t1", "search", json!({"count": 2})),
         ];
-        let messages = to_messages(&history).unwrap();
+        let messages = to_messages(&history, false).unwrap();
         match &messages[1].content()[0] {
             bt::ContentBlock::ToolUse(t) => {
                 assert_eq!(t.tool_use_id(), "t1");
@@ -413,7 +435,7 @@ mod tests {
             Message::tool_call("t1", "search", json!({})),
             Message::tool_result("t1", "search", json!({})),
         ];
-        let err = to_messages(&history).unwrap_err();
+        let err = to_messages(&history, false).unwrap_err();
         assert!(!err.is_retryable(), "{err}");
     }
 
@@ -424,7 +446,7 @@ mod tests {
             Message::assistant("earlier summary"),
             Message::user("next"),
         ];
-        let messages = to_messages(&history).unwrap();
+        let messages = to_messages(&history, false).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role(), &bt::ConversationRole::User);
     }
@@ -437,7 +459,7 @@ mod tests {
                 .with_required(["q"]),
         );
         let request = GenerateRequest::new("m", vec![Message::user("hi")]).with_tools(vec![tool]);
-        let config = build_tool_config(&request).unwrap().unwrap();
+        let config = build_tool_config(&request, false).unwrap().unwrap();
         match &config.tools()[0] {
             bt::Tool::ToolSpec(spec) => {
                 assert_eq!(spec.name(), "search");
@@ -456,6 +478,84 @@ mod tests {
             }
             other => panic!("expected tool spec, got {other:?}"),
         }
+    }
+
+    fn cached_request(system: Option<&str>) -> GenerateRequest {
+        let mut request = GenerateRequest::new(
+            "m",
+            vec![
+                Message::user("red shoes"),
+                Message::assistant("Here you go."),
+                Message::user("cheaper ones?"),
+            ],
+        )
+        .with_tools(vec![ToolDefinition::new("search", "Search the catalog")])
+        .with_prompt_cache(true);
+        if let Some(system) = system {
+            request = request.with_system(system);
+        }
+        request
+    }
+
+    fn ends_with_cache_point(blocks: &[bt::ContentBlock]) -> bool {
+        matches!(blocks.last(), Some(bt::ContentBlock::CachePoint(_)))
+    }
+
+    #[test]
+    fn prompt_cache_marks_the_system_prompt_and_the_last_message() {
+        let parts = to_converse(&cached_request(Some("You are a shop assistant."))).unwrap();
+        assert!(matches!(
+            parts.system.as_slice(),
+            [
+                bt::SystemContentBlock::Text(_),
+                bt::SystemContentBlock::CachePoint(_)
+            ]
+        ));
+        let tools = parts.tools.unwrap();
+        assert!(
+            !tools
+                .tools()
+                .iter()
+                .any(|t| matches!(t, bt::Tool::CachePoint(_)))
+        );
+        let last = parts.messages.last().unwrap();
+        assert!(ends_with_cache_point(last.content()));
+        assert!(!ends_with_cache_point(parts.messages[0].content()));
+    }
+
+    #[test]
+    fn prompt_cache_marks_the_tools_when_there_is_no_system_prompt() {
+        let parts = to_converse(&cached_request(None)).unwrap();
+        assert!(parts.system.is_empty());
+        let tools = parts.tools.unwrap();
+        assert!(matches!(
+            tools.tools().last(),
+            Some(bt::Tool::CachePoint(_))
+        ));
+        assert!(ends_with_cache_point(
+            parts.messages.last().unwrap().content()
+        ));
+    }
+
+    #[test]
+    fn no_cache_points_without_prompt_cache() {
+        let request = cached_request(Some("sys")).with_prompt_cache(false);
+        let parts = to_converse(&request).unwrap();
+        assert_eq!(parts.system.len(), 1);
+        assert!(
+            !parts
+                .tools
+                .unwrap()
+                .tools()
+                .iter()
+                .any(|t| matches!(t, bt::Tool::CachePoint(_)))
+        );
+        assert!(
+            parts
+                .messages
+                .iter()
+                .all(|m| !ends_with_cache_point(m.content()))
+        );
     }
 
     #[test]
@@ -487,6 +587,7 @@ mod tests {
         let u = to_usage(&usage);
         assert_eq!(u.input_tokens, Some(150));
         assert_eq!(u.cached_input_tokens, Some(40));
+        assert_eq!(u.cache_write_input_tokens, Some(10));
         assert_eq!(u.output_tokens, Some(20));
         assert_eq!(u.total_tokens, Some(170));
     }

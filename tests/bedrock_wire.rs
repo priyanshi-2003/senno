@@ -115,6 +115,46 @@ async fn converse_sends_history_tools_and_guardrail_and_parses_tool_call() {
 }
 
 #[tokio::test]
+async fn prompt_cache_sends_cache_points_and_reports_cache_writes() {
+    let server = StubServer::start(|_| {
+        Reply::ok(
+            json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "Hi."}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 20, "outputTokens": 5, "totalTokens": 1225,
+                          "cacheWriteInputTokens": 1200}
+            })
+            .to_string(),
+        )
+    })
+    .await;
+    let client = client(&server, BedrockConfig::default()).await;
+
+    let request = GenerateRequest::new(
+        "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        vec![Message::user("hello")],
+    )
+    .with_system("You are a shop assistant.")
+    .with_tools(vec![ToolDefinition::new("search_catalog", "Search")])
+    .with_prompt_cache(true);
+    let response = client.generate(&request).await.expect("converse");
+
+    let body = server.requests()[0].json();
+    assert_eq!(
+        body["system"],
+        json!([{"text": "You are a shop assistant."}, {"cachePoint": {"type": "default"}}])
+    );
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([{"text": "hello"}, {"cachePoint": {"type": "default"}}])
+    );
+
+    let usage = response.usage.expect("usage");
+    assert_eq!(usage.cache_write_input_tokens, Some(1200));
+    assert_eq!(usage.input_tokens, Some(1220));
+}
+
+#[tokio::test]
 async fn throttling_maps_to_a_retryable_error() {
     let server = StubServer::start(|_| {
         Reply::error(429, r#"{"message":"Too many tokens, please wait"}"#)
