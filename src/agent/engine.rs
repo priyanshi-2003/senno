@@ -383,15 +383,20 @@ async fn compact_or_truncate(
         }
     }
 
-    // No compactor, or no valid split: raw truncate.
-    messages.drain(..ideal);
-    strip_orphan_tool_results_head(messages);
+    let split = find_user_split(messages, ideal)
+        .or_else(|| {
+            messages
+                .iter()
+                .rposition(|m| matches!(m, ChatMessage::User { .. }))
+        })
+        .filter(|&split| split > 0)?;
+    messages.drain(..split);
     let after_len = messages.len();
     Some(CompactionResult {
         strategy: "truncate",
         messages_before: before_len,
         messages_after: after_len,
-        summarized: ideal,
+        summarized: split,
         summary: None,
         elapsed_ms: start.elapsed().as_millis() as u64,
         model: None,
@@ -488,11 +493,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_truncate_strips_orphan_tool_result() {
-        let mut msgs = vec![user("a"), tc("1"), tr("1"), assistant("b")];
+    async fn raw_truncate_cuts_at_a_user_message() {
+        let mut msgs = vec![user("a"), tc("1"), tr("1"), user("b"), assistant("c")];
+        compact_or_truncate(&mut msgs, 3, None).await;
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], ChatMessage::User { content } if content == "b"));
+    }
+
+    #[tokio::test]
+    async fn raw_truncate_keeps_the_current_turn_whole() {
+        let mut msgs = vec![
+            user("a"),
+            assistant("b"),
+            user("c"),
+            tc("1"),
+            tr("1"),
+            assistant("d"),
+        ];
         compact_or_truncate(&mut msgs, 2, None).await;
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], ChatMessage::Assistant { .. }));
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[0], ChatMessage::User { content } if content == "c"));
+    }
+
+    #[tokio::test]
+    async fn raw_truncate_is_a_noop_when_only_the_first_message_is_from_the_user() {
+        let mut msgs = vec![user("a"), tc("1"), tr("1"), assistant("b")];
+        assert!(compact_or_truncate(&mut msgs, 2, None).await.is_none());
+        assert_eq!(msgs.len(), 4);
     }
 
     #[tokio::test]
